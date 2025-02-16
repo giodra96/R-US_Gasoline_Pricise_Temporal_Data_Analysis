@@ -1,0 +1,905 @@
+---
+title: "Studio sull'andamento del prezzo della benzina negli Stati Uniti dal 1995 al 2021"
+author: "Giorgio Dramis"
+date: "2024-07-21"
+output: html_document
+---
+
+# Introduzione
+
+<div style="text-align: justify;">
+Il lavoro svolto nel presente elaborato si propone di effettuare uno studio sull'andamento dei prezzi della benzina negli Stati Uniti, utilizzando una serie storica fruibile gratuitamente online sul sito web dell'EIA ( __[U.S. Energy Information Administration](https://www.eia.gov/dnav/pet/pet_pri_gnd_dcus_nus_w.htm)__), nella sezione "Petroleum & Other Liquids".
+
+I dati contenuti nel dataset estratto (una raccolta che parte dal 1995 e arriva al 2021) sono prezzi al dettaglio relativi a diversi tipi e formulazioni di carburante.
+
+# Descrizione del dataset
+
+Come menzionato nell’introduzione, la serie storica adoperata per l'analisi riassume l'evoluzione del mercato del carburante nell'arco di circa **25 anni**. In particolare, sono inclusi i prezzi di 13 combinazioni di tipi e formulazioni di benzina, più una variabile relativa esclusivamente al diesel.
+
+- **Tipologia** di benzina:
+
+  - All Grades: include tutti i tipi di benzina (Regular, Midgrade e Premium).
+  - Regular: il tipo di benzina con il più basso numero di ottano, circa 87 (solitamente la più economica).
+  - Midgrade: ha un numero di ottano intermedio, tipicamente intorno a 89.
+  - Premium: ha il numero di ottano più alto, generalmente 91 o superiore, ed è progettata per motori ad alte prestazioni (solitamente la più costosa).
+  
+- **Formulazioni**:
+
+  - All Formulations: include tutte le formulazioni di benzina (conventional e reformulated).
+  - Conventional: carburante standard prodotto e distribuito senza modifiche specifiche per ridurre l'inquinamento.
+  - Reformulated: modificata chimicamente per ridurre l'emissione di sostanze inquinanti, particolarmente in aree con elevati livelli di smog.
+
+- **Diesel**: il tipo di diesel più comunemente utilizzato nei veicoli.
+
+```{r installation, echo=FALSE, message=FALSE, warning=FALSE}
+
+#install.packages("forecast")
+library(forecast)
+#install.packages("lubridate")
+library(lubridate)
+#install.packages("dplyr")
+library(dplyr)
+#install.packages("seastests")
+library(seastests)
+#install.packages("gridExtra")
+library(gridExtra)
+#install.packages("outliers")
+library(outliers)
+#install.packages("tseries")
+library(tseries)
+#install.packages("timeSeries")
+library(timeSeries)
+#install.packages("fBasics")
+library(fBasics)
+#install.packages("sarima")
+library(sarima)
+#install.packages("ggplot2")
+library(ggplot2)
+#install.packages("zoo")
+library(zoo)
+
+source <- read.csv("PET_PRI_GND_DCUS_NUS_W.csv") # importazione dataset
+glimpse(source)
+data <- source
+
+```
+
+Tali prezzi settimanali, espressi in **€ al gallone americano** (circa 3,8 litri), sono combinazioni delle caratteristiche appena descritte. Per esempio:
+
+* A1: prezzo medio di tutti i tipi e tutte le formulazioni di benzina;
+* A2: prezzo medio di tutti i tipi di benzina convenzionale;
+* A3: prezzo medio di tutti i tipi di benzina riformulata;
+
+E ancora: 
+
+* P1: prezzo medio di tutte le formulazioni di benzina con alto contenuto di ottano;
+* R2: prezzo specifico della benzina convenzionale con ottano regolare;
+* M3: prezzo specifico della benzina riformulata con ottano intermedio;
+
+* D1: prezzo del diesel.
+
+# Analisi preliminare dei dati
+
+```{r NAs&duplicates, echo=FALSE, message=FALSE, warning=FALSE}
+
+data$Date <- as.Date(data$Date, format = "%m/%d/%Y") # conversione da chr a formato data
+
+# verifica della presenza di valori nulli:
+source_null <- data[rowSums(is.na(source))>0, ] # nessun NA
+
+# verifica della presenza di duplicati:
+duplicati <- data[duplicated(data) | duplicated(data, fromLast = TRUE), ] # nessun duplicato
+
+remove(source_null, duplicati)
+
+```
+
+<div style="text-align: justify;">
+Tra tutti i prezzi raccolti nel dataset, si decide di effettuare un'operazione di selezione e focalizzare l'analisi su una sola tra le 14 serie storiche presenti. Tale scelta è giustificata dall'ipotesi che, dal punto di vista macroeconomico, i trend che si sono susseguiti nel tempo nell'evoluzione dei prezzi di tutte le varietà di carburante abbiano avuto la medesima determinante, ossia le variazioni del prezzo del petrolio. 
+
+Portando avanti l'ipotesi che effettuare l'analisi su qualsiasi tra i prezzi disponibili nel dataset porti a risultati analoghi, si visualizza di seguito la dimostrazione che vi sia correlazione tra questi ultimi:
+</div>
+
+```{r correlation_prices, echo=FALSE, message=FALSE, warning=FALSE}
+
+encode_labels <- function(column) {
+  unique_labels <- unique(column)
+  labels_to_numbers <- as.numeric(factor(column, levels = unique_labels))
+  return(labels_to_numbers)
+}
+
+temp <- data[,-1] # esclusione dell'informazione sulla data
+cormatrix <- cor(temp)
+
+cat("Minimo tra le correlazioni:", min(cormatrix), "\n")
+
+# heatmap delle correlazioni
+heatmap(cormatrix, 
+        symm = TRUE,  # TRUE rende la matrice simmetrica
+        col = colorRampPalette(c("#FFC1B9", "red"))(100),
+        main = "")
+
+```
+
+<div style="text-align: justify;">
+La heatmap mostra la correlazione tra i prezzi delle diverse varietà di carburante. Come ipotizzato, sono tutte molto alte, con la minima pari a 0,97.
+
+Si compara la variabile A1, ossia la media dei prezzi per ogni tipologia e formulazione di benzina, con la variabile D1, il prezzo del diesel:
+</div>
+
+```{r benzina&diesel, echo=FALSE, message=FALSE, warning=FALSE}
+
+remove(temp, cormatrix, encode_labels)
+
+benzina <- data[,c(1,2)]
+names(benzina)[names(benzina) == "A1"] <- "Benzina"
+
+diesel <- data[,c(1,14)]
+names(diesel)[names(diesel) == "D1"] <- "Diesel"
+
+# i dati vengono aggregati per anno e mese, piuttosto che per settimana, utilizzando valori medi di prezzo.
+benzina <- benzina %>%
+  mutate(DateYM = format(Date, "%Y-%m")) %>%  # Creazione di una colonna con anno-mese
+  group_by(DateYM) %>%
+  summarise(AvgBenzina = mean(Benzina))
+
+benzina$DateYM <- as.Date(paste0(benzina$DateYM, "-01")) # conversione al formato data - giorno fittizio 01 per corretto funzionamento
+benzina$AvgBenzina <- round(benzina$AvgBenzina, 2) # arrotondamento al secondo decimale
+
+diesel <- diesel %>%
+  mutate(DateYM = format(Date, "%Y-%m")) %>%  # Creazione di una colonna con anno-mese
+  group_by(DateYM) %>%
+  summarise(AvgDiesel = mean(Diesel))
+
+diesel$DateYM <- as.Date(paste0(diesel$DateYM, "-01"))  # conversione al formato data - giorno fittizio 01 per corretto funzionamento
+diesel$AvgDiesel <- round(diesel$AvgDiesel, 2) # arrotondamento al secondo decimale
+
+# Per visualizzare l'evoluzione dei prezzi nel corso degli anni si convertono i due dataset in oggetti di tipo TimeSeries
+
+# estrazione anno e mese benzina
+benzina$Year <- year(benzina$DateYM)
+benzina$Month <- month(benzina$DateYM)
+
+# estrazione anno e mese diesel
+diesel$Year <- year(diesel$DateYM)
+diesel$Month <- month(diesel$DateYM)
+
+# estrazione della data di partenza, che sarà uguale per entrambi
+start_year <- year(min(benzina$DateYM))
+start_month <- month(min(benzina$DateYM))
+
+ts1 <- ts(benzina$AvgBenzina, start = c(start_year, start_month), frequency = 12)
+ts2 <- ts(diesel$AvgDiesel, start = c(start_year, start_month), frequency = 12)
+
+plot(ts1, ylab = "Media prezzo benzina")
+plot(ts2, ylab = "Media prezzo diesel") 
+
+```
+
+<div style="text-align: justify;">
+Si evince che i prezzi della benzina e del diesel tendono a seguire andamenti **simili**, per la maggior parte del periodo analizzato. Entrambi i carburanti mostrano picchi e valli analoghi, suggerendo che i fattori che influenzano i prezzi sono comuni a entrambi i mercati. Osservando più nel dettaglio, alcune osservazioni:
+</div>
+
+```{r comparison, echo=FALSE, message=FALSE, warning=FALSE}
+
+ts.plot(ts1,ts2, lty=c(1:2), col=c("red", "blue"))
+legend("topleft", legend=c("Benzina", "Diesel"), lty=c(1:2), col=c("red","blue"))
+
+```
+
+<div style="text-align: justify;">
+* Entrambi i carburanti mostrano una tendenza generale al **rialzo** dei prezzi nel corso degli anni, con alcune fluttuazioni significative.
+* Il grafico evidenzia la natura volatile dei prezzi dei carburanti, influenzati da vari fattori economici, geopolitici e di mercato. Si osserva in particolare una grande volatilità attorno al **2008-2009**, con un picco elevato seguito da un rapido calo. Questo periodo coincide con la crisi finanziaria globale.
+* Dopo il 2010, i prezzi hanno continuato a mostrare una tendenza al rialzo con diverse fluttuazioni.
+* Il calo osservabile nel 2015 è attribuibile a una combinazione di eccesso di offerta di petrolio, decisioni strategiche dell'OPEC adottate nel 2014 e conseguente calo dei prezzi del petrolio greggio, aumento della produzione di shale oil negli Stati Uniti e un rallentamento della domanda globale.
+* Si è raggiunta un'altra valle di simile profondità anche nel 2020, intuitivamente legata alla pandemia di Covid-19. Il lockdown ha causato una drastica riduzione della mobilità, con conseguente riduzione della domanda di carburanti per il trasporto, sia per veicoli privati che per aerei e trasporti pubblici.
+
+Si prosegue con l'analisi esclusivamente sui dati relativi ai prezzi della **benzina**.
+</div>
+
+# Pre-processamento
+
+```{r outliers, echo=FALSE, message=FALSE, warning=FALSE}
+
+ts <- ts1
+remove(diesel,ts1,ts2,start_month,start_year)
+
+boxplot(ts, 
+        main = "Distribuzione dei valori di prezzo della benzina",
+        ylab = "Prezzo",
+        col = "blue"
+)
+
+# Identificazione degli outliers basati sui whiskers del boxplot
+outliers <- boxplot(ts, plot = FALSE)$out # sulla base del boxplot non vengono identificati affatto outliers
+
+# Si possono identificare gli outliers anche con i limiti: ad esempio, oltre ±3 deviazioni standard dalla media.
+
+media <- mean(ts)
+deviazione_std <- sd(ts)
+limite_inf <- media - 3 * deviazione_std
+limite_sup <- media + 3 * deviazione_std
+
+outliers <- ts[ts < limite_inf | ts > limite_sup] # ancora una volta non vengono rilevati outliers
+
+remove(deviazione_std,limite_inf,limite_sup,media,outliers)
+
+```
+
+<div style="text-align: justify;">
+La mancata individuazione di outliers non è necessariamente sorprendente: talvolta, se la variabilità dei dati è limitata e non ci sono deviazioni significative rispetto alla media o ai quartili, i metodi che considerano le deviazioni standard o l'intervallo interquartile potrebbero non rilevare outliers.
+</div>
+
+## Stagionalità
+
+<div style="text-align: justify;">
+Per studiare nel dettaglio come la serie storica si divida nelle sue componenti (trend, stagionale, erratica), si effettua una **scomposizione moltiplicativa**.
+
+Si predilige la moltiplicativa contro la additiva perché, nonostante l'oggetto dello studio sia la benzina, ci si muove nel campo delle **vendite al dettaglio**: la scomposizione moltiplicativa è spesso utilizzata per analizzare le vendite al dettaglio poiché la stagionalità di solito ha un effetto proporzionale al livello delle vendite. Ciò verrà confermato nelle sezioni a seguire. Inoltre, visto che la serie presenta un **trend** approssimativamente **crescente**, la scomposizione moltiplicativa è più appropriata, poiché cattura il trend in modo più efficace rispetto alla additiva.
+</div>
+
+```{r decompose, echo=FALSE, message=FALSE, warning=FALSE}
+
+plot(decompose(ts, "multiplicative"))
+# autoplot(decompose(ts, "multiplicative"), main="Scomposizione moltiplicativa") # altra versione del grafico
+
+```
+
+Si presti attenzione alla componente stagionale. Viene analizzata più nel dettaglio:
+
+```{r estaciones, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggseasonplot(ts, year.labels=TRUE, year.labels.left=TRUE, ylab="Prezzo", main="Seasonal plot") 
+ggseasonplot(ts, polar=TRUE, ylab="Prezzo", main="Polar seasonal plot")
+
+```
+
+Dai due grafici della stagionalità si intravede un pattern di aumento dei prezzi nei mesi estivi, specialmente a partire dal nuovo millennio e via via più marcato negli anni a seguire. Si osservi una ulteriore rappresentazione dove si mostrano anche le medie mensili anno dopo anno:
+
+```{r estaciones2, echo=FALSE, message=FALSE, warning=FALSE}
+
+ggsubseriesplot(ts, ylab="Prezzo", main="Seasonal subseries plot")
+
+```
+
+Qui si osserva chiaramente un aumento della media di prezzo che parte da Marzo-Aprile e decresce a partire da Settembre. Si cerca una conferma finale tramite codice:
+
+```{r estaciones3, echo=TRUE, message=FALSE, warning=FALSE}
+
+isSeasonal(ts, freq=12)
+
+# Il test, eseguito con i parametri di default della funzione isSeasonal(), resistuisce 'FALSE'.
+
+# Indagando più a fondo nelle impostazioni della funzione, si individua la ragione di ciò nel fatto che il test "combined" di default è parametrico e assume una distribuzione normale dei dati.
+
+# Sospettando che la serie storica in esame abbia distribuzione tutt'altro che normale, si effettua una verifica:
+
+hist(data$A1, breaks = 15, main = "Frequenza dei prezzi della benzina", xlab = "Prezzo", ylab = "", col = "lightblue", probability = TRUE)
+lines(density(data$A1, adjust = 1), col = "red", lwd = 2)
+legend("topright", legend = "Densità", col = "red", lty = 1, lwd = 2)
+
+```
+
+Dall'istogramma risulta che la distribuzione dei dati **non** sia normale, anche lo Shapiro Test lo conferma, con valore di p-value tale da indurre a rifiutare l'ipotesi nulla (che la distribuzione dei dati sia nornamle):
+
+```{r estaciones4, echo=FALSE, message=FALSE, warning=FALSE}
+
+shapiro.test(ts)
+
+```
+
+Per concludere, il Friedman Test (che utilizza un metodo non parametrico per effettuare la valutazione) rafforza l'ipotesi che i dati di questa serie storica presentino stagionalità:
+
+```{r estaciones5, echo=TRUE, message=FALSE, warning=FALSE}
+
+isSeasonal(ts, test="fried", freq=12)
+
+```
+
+<div style="text-align: justify;">
+Ci sono vari fattori che contribuiscono alla stagionalità dei prezzi della benzina, primo tra tutti: la **domanda stagionale**. Durante i mesi caldi, la domanda aumenta poiché più persone viaggiano per le vacanze estive. Questo aumento della domanda spesso porta a un aumento dei prezzi. Nei mesi invernali la domanda tende a diminuire e, di conseguenza, i prezzi spesso scendono.
+
+Inoltre, durante l'estate, molte regioni richiedono l'uso di **formulazioni di benzina speciali** (come la benzina riformulata) che producono meno emissioni inquinanti. Queste formulazioni sono intuitivamente più costose da produrre, il che si riflette nell'aumento dei prezzi medi che si vede rappresentato nel grafico. In inverno, le regolamentazioni sono meno restrittive e le formulazioni meno costose possono tornare ad essere utilizzate.
+<div>
+
+# Verifica della stazionarietà
+
+## Analisi visiva: autocorrelazione
+
+<div style="text-align: justify;">
+A questo punto dell'analisi, si vuole selezionare il modello che si adatti di più alla serie storica per descriverne l'andamento con la massima precisione possibile. Per far ciò, un primo passo è osservare se la serie è o no stazionaria.
+
+Attraverso tutti i grafici che sono stati visualizzati fino ad ora, si intuisce come probabilmnte la serie **non lo sia**: una serie stazionaria non dovrebbe presentare trend o stagionalità evidenti. Per verificarlo, si effettua anzitutto un'analisi grafica basata sulla funzione di autocorrelazione.
+<div>
+
+```{r autocorrelogramma, echo=FALSE, message=FALSE, warning=FALSE}
+
+acf(coredata(ts), lag.max=36) # pacchetto fBasics 
+pacf(coredata(ts), lag.max=36)
+
+```
+
+<div style="text-align: justify;">
+In base all'analisi degli autocorrelogrammi, si può concludere che la serie storica in esame presenta una **forte autocorrelazione di breve termine**. Questo significa che i valori della serie sono influenzati in modo significativo dai valori che li precedono di un piccolo numero di periodi, e che le informazioni da tempi più lontani non sono così pertinenti per prevedere il valore corrente.
+
+Nelle serie storiche stazionarie, i valori di autocorrelazione dovrebbero decadere rapidamente a zero, ma non è questo il caso. Potrebbe essere necessario **trasformarla**, prima di procedere all'utilizzo di modelli di analisi statistica.
+
+Un altro grafico che aiuta nell'individuazione delle autocorrelazioni è il seguente insieme di scatterplots per diversi lag da 1 a 24.
+
+```{r lagplot, echo=FALSE, message=FALSE, warning=FALSE}
+
+lag.plot(ts, lags=24)
+
+```
+
+Una versione colorata dello stesso può aiutare ulteriormente a fornire informazioni sulla stagionalità annuale individuata:
+
+```{r lagplot_colored, echo=FALSE, message=FALSE, warning=FALSE}
+
+gglagplot(ts, lags=24, do.lines=F,labels = FALSE, seasonal = TRUE)
+
+```
+
+<div style="text-align: justify;">
+Ogni pannello rappresenta la relazione tra la serie temporale originale e sé stessa con un lag specifico (da 1 a 24).
+
+La presenza di un pattern lineare, nei primi pannelli in particolare, indica una forte correlazione tra i valori della serie temporale separati da quel numero di ritardi. Tale correlazione diventa meno evidente con l'aumentare del ritardo, indicando che i valori della serie temporale non sono fortemente correlati con valori molto più vecchi. Ciò rafforza l'osservazione di forte autocorrelazione di breve termine precedentemente descritta.
+
+I colori rappresentano i diversi mesi dell'anno, il che permette di visualizzare se ci sono effetti stagionali. I punti colorati per mese mostrano alcuni pattern ripetitivi, suggerendo la presenza di una stagionalità: ad esempio, i mesi 1 e 12 (indicati con colori simili) possono raggrupparsi insieme, riflettendo un effetto stagionale annuale.
+
+Il pattern di autocorrelazione e stagionalità osservato qui supporta l'uso di un modello SARIMA con componenti stagionali P, D, Q [12].
+
+## Test statistici
+
+Oltre all'analisi visiva, si effettuano due test statistici per decretare definitivamente che la serie storica dei prezzi della benzina non è stazionaria:
+
+* Test di **Augmented Dickey-Fuller (ADF)**: per verificare la presenza di una radice unitaria (indice che la serie non è stazionaria). Viene utilizzato rispetto alla versione omonima ma "non-augmented" perché quest'ultima non tiene conto della stagionalità.
+* Test di **KPSS** (Kwiatkowski-Phillips-Schmidt-Shin): per verificare l'ipotesi nulla di stazionarietà.
+<div>
+
+```{r ADF, echo=FALSE, message=FALSE, warning=FALSE}
+
+adf.test(ts, alternative = "stationary") 
+
+```
+
+Con un p-value di 0.7, che è molto superiore al livello di significatività comune di 0.05, non si rifiuta l'ipotesi nulla. Questo suggerisce che la serie temporale è **non** stazionaria.
+
+```{r KPSS, echo=FALSE, message=FALSE, warning=FALSE}
+
+kpss.test(ts)
+
+```
+
+Stavolta il risultato di p-value del KPSS Test porta a rifiutare l'ipotesi nulla. Tuttavia, a differenza del test di Dickey-Fuller, il test KPSS ha come ipotesi nulla la stazionarietà. Di conseguenza il verdetto non cambia: la serie storica è **non** stazionaria.
+
+# Partizionamento in training & test set e differenziazione
+
+```{r data_partitioning, echo=TRUE, message=FALSE, warning=FALSE}
+
+h <- 37L
+train <- head(ts, round(length(ts) - h))
+train <- diff(train)
+test <- diff(tail(ts, h))
+
+# verifica della stazionarietà
+lag.plot(train, lags=24)
+adf.test(train, alternative = "stationary") 
+
+```
+  
+Dagli scatterplot dei log si intuisce come l'iterazine di differenziazione abbia portato alla stazionarietà. Ciò è confermato dal test statistico.
+Da ora in poi verrà utilizzato solo il training set per il pre-processing e la creazione del modello.
+
+# Scelta e implementazione dei modelli
+
+Il passo successivo è la scelta del modello opportuno per effettuare previsioni sul test set. In base alle caratteristiche della serie storica e all'obiettivo della predizione, è necessario scegliere un modello di apprendimento automatico adatto. A seguire, verranno implementati:
+
+* Modelli SARIMA: adatti per serie storiche con stagionalità e autocorrelazione;
+* Reti neurali: adatte per modelli complessi e non lineari.
+
+# Stima dei parametri dei modelli SARIMA
+
+Si avvia l'analisi con l'implementazione di un modello SARIMA (invece di un modello ARIMA, per tener conto della stagionalità), di conseguenza sarà necessario stimare i parametri da dare in input.
+
+Nello specifico, il modello **SARIMA(p,d,q)(P,D,Q)[s]** si compone di parametri non stagionali (comuni al modello ARIMA) e stagionali:
+
+* Parametri non stagionali (ARIMA):
+  * p (autoregressivo - AR): il numero di termini autoregressivi. Rappresenta il numero di lag delle osservazioni incluse nel modello.
+  * d (integrazione - I): il numero di differenziazioni non stagionali necessarie per rendere la serie stazionaria.
+  * q (media mobile - MA): il numero di termini della media mobile. Rappresenta il numero di lag degli errori inclusi nel modello.
+  
+* Parametri Stagionali (SARIMA):
+  * P (autoregressivo stagionale - SAR): il numero di termini autoregressivi stagionali.
+  * D (integrazione stagionale - SI): il numero di differenziazioni stagionali necessarie per rendere la serie stazionaria.
+  * Q (media mobile stagionale - SMA): il numero di termini della media mobile stagionale.
+
+* Valore relativo alla stagionalità:
+  * S: il numero di periodi. Nel caso in esame, si estrapola un valore di **S = 12** (essendo i dati mensili con stagionalità annuale).
+
+Per le stime, si parte dai grafici di ACF e PACF:
+<div>
+
+```{r acf2, echo=FALSE, message=FALSE, warning=FALSE}
+
+acf(coredata(train), lag.max=36)
+
+```
+
+<div style="text-align: justify;">
+Dal grafico dell'ACF si deduce ora il valore di **q**, ossia il numero di termini della media mobile. In questo caso è pari a **1**, che, osservando l'intervallo di confidenza trattegiato nel grafico, è uguale al lag in corrispondenza dell'ultima linea verticale che non rientra al suo interno.
+
+Inoltre, si stimano **P e Q** (rispettivamente il numero di termini autoregressivi stagionali e il numero di termini della media mobile stagionale):
+
+* P ≥ 1 se il valore di ACF è positivo in corrispondenza del lag S=12; 0 altrimenti.
+* Q ≥ 1 se il valore di ACF è negativo in corrispondenza del lag S=12; 0 altrimenti.
+* Rule of thumb: P+Q ≤ 2
+
+Si deducono dunque **Q = 0** e **P = 1** oppure **P = 2**. Entrambi i valori di P verranno implementati e verrà effettuato un confronto sulla bontà dei modelli ottenuti.
+
+<div>
+
+```{r pacf2, echo=FALSE, message=FALSE, warning=FALSE}
+
+pacf(coredata(train), lag.m=36)
+
+```
+
+<div style="text-align: justify;">
+Dal grafico del PACF si individua **p = 2**, similmente al caso precedente di q, osservando l'intervallo di confidenza trattegiato nel grafico, il lag 2 è quello in corrispondenza del quale vi è l'ultima linea verticale che non rientra al suo interno.
+
+Ultimi parametri che restano sono **d e D**:
+
+* **d = 0** implica che il modello effettuerà una differenziazione semplice sui dati, trasformando la serie temporale in una serie differenziata di primo ordine.
+* **D = 1** implica che il modello effettuerà una differenziazione stagionale sui dati.
+
+# Training del modello SARIMA
+
+Considerato quando detto, i modelli vengono implementati come a seguire:
+
+* **SARIMA 1** - ARIMA(2,0,1)(1,1,0)[12]
+* **SARIMA 2** - ARIMA(2,0,1)(2,1,0)[12]
+
+<hr>
+<div>
+
+```{r sarima1, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(1234)
+
+sarima_model <- Arima(train, order = c(2, 0, 1), seasonal = list(order = c(1, 1, 0), period = 12))
+summary(sarima_model)
+
+```
+
+<div style="text-align: justify;">
+Questo output suggerisce che il modello ARIMA(2,0,1)(1,1,0)[12] fornisce un adattamento ragionevole ai dati della serie temporale del training set con stagionalità ogni 12 periodi. 
+
+Si applicano due test per la verifica di presenza di autocorrelazioni tra i residui:
+<div>
+
+```{r sarima1.2, echo=FALSE, message=FALSE, warning=FALSE}
+
+res1 <- sarima_model$residuals
+Box.test(res1, lag = 24, type = "Box-Pierce", fitdf=4) # lag = 24 (proporzionale alla stagionalità (12) e rientra nell'intervallo consigliabile 16-27 visto il numero di osservazioni)
+#Box.test(res1, lag = 24, type = "Ljung-Box", fitdf=4)
+checkresiduals(sarima_model) # Ljung-Box test + grafici
+
+```
+
+<div style="text-align: justify;">
+Per eseguire tali test è stato utilizzato un numero di **lag pari a 24**. Una regola comune è utilizzare un numero di lag che sia una frazione del numero totale di osservazioni, nel caso del training set in esame, 276. Nello specifico, un valore compreso tra radice di 276 e 276/10 (intervallo 16-27). Considerando inoltre che la serie storica in esame è stagionale, è opportuno che il numero di lag sia multiplo dei periodi della stagionalità. Ecco la ragione dietro la scelta del numero 24, che rientra nell'intervallo dettato dalla regola generale ed è multiplo di 12 (periodi S).
+
+I risultati mostrati sono l'output dei test di **Box-Pierce** e **Ljung-Box**. Il p-value di entrambi è molto piccolo, cosa che indica la presenza di autocorrelazioni significative nei residui del modello: potrebbe non essere completamente adeguato e potrebbe essere necessario rivederlo, esplorare modelli alternativi, o eseguire trasformazioni sui dati per migliorarne l'adattamento.
+
+A tal proposito, si procede con P=2.
+<div>
+
+```{r sarima2, echo=FALSE, message=FALSE, warning=FALSE}
+
+set.seed(1234)
+
+sarima_model2 <- Arima(train, order = c(2, 0, 1), seasonal = list(order = c(2, 1, 0), period = 12))
+summary(sarima_model2)
+
+```
+
+<div style="text-align: justify;">
+Il modello ARIMA(2,0,1)(2,1,0)[12] è **preferibile** rispetto al modello precedente, basandosi sui criteri AIC, AICc e BIC e sul valore di RMSE.Ha inoltre una migliore aderenza ai dati, è più parsimonioso e presenta errori di previsione inferiori sul set di addestramento.
+
+I residui:
+
+```{r sarima1.22, echo=FALSE, message=FALSE, warning=FALSE}
+
+res1.2 <- sarima_model2$residuals
+Box.test(res1.2, lag = 24, type = "Box-Pierce", fitdf=4)
+#Box.test(res1.2, lag = 24, type = "Ljung-Box", fitdf=4)
+checkresiduals(sarima_model2) # Ljung-Box test + grafici
+
+```
+
+<div style="text-align: justify;">
+
+Nonostante il valore di p-value sia migliorato rispetto al modello precedente, porta ancora a rifiutare l'ipotesi nulla, implicando la presenza di autocorrelazioni tra i residui.
+
+Si decide  di applicare la funzione **auto.arima()**, per confrontare i parametri identificati automaticamente dall'algoritmo con quanto valutato fino ad ora.
+<div>
+
+# Training del modello auto.arima()
+
+```{r autoarima2, echo=FALSE, message=FALSE, warning=FALSE}
+
+auto_model <- auto.arima(train, ic="aic", stationary = FALSE, seasonal = TRUE) 
+
+# aic (Akaike Information Criterion) è il default per il parametro 'ic'
+# stationary = FALSE perché non occorrono ulteriori standardizzazioni (la serie è già stazionaria)
+# seasonal=TRUE: l'algoritmo considererà la stagionalità nella serie temporale
+
+summary(auto_model)
+
+```
+
+E' stato identificato, come miglior modello, un ARIMA(2,0,2), che sembra avere una buona adattabilità ai dati basata sui coefficienti e sulle metriche di informazione (AIC, AICc, BIC).
+
+Analisi dei residui:
+
+```{r autoarima2.1, echo=FALSE, message=FALSE, warning=FALSE}
+
+res2 <- auto_model$residuals
+Box.test(res2, lag = 24, type = "Box-Pierce", fitdf=4)
+# Box.test(res2, lag = 24, type = "Ljung-Box", fitdf=4)
+checkresiduals(auto_model) # Ljung-Box test + grafici
+
+```
+
+Poiché stavolta il p-value è significativamente maggiore di 0.05, i residui del modello implementato automaticamente ARIMA(2,0,2) **non** presentano autocorrelazioni significative.
+
+```{r autoarima2.2, echo=FALSE, message=FALSE, warning=FALSE}
+
+tsdiag(auto_model, gof.lag=24, main="")
+
+```
+
+<div style="text-align: justify;">
+La scelta del modello dovrebbe considerare non solo la **significatività dei test sui residui**, ma anche altri fattori come **AIC, BIC, e la complessità del modello**. In questo caso, sulla base delle metriche di confronto e dei test sui residui, l'ARIMA(2,0,2) emerge come il candidato iniziale più promettente. 
+
+* ARIMA(2,0,1)(1,1,0)[12]: Ha i valori di informazione del modello più bassi, ma il test di Box-Pierce sui residui è altamente significativo (p-value molto piccolo), scartando questo modello come opzione valida. I residui fortemente non white noise indicano che il modello **non** è riuscito a catturare la struttura dei dati.
+
+* ARIMA(2,0,1)(2,1,0)[12]: Presenta valori di informazione del modello intermedi rispetto agli altri due, ma il test di Box-Pierce indica che i residui non sono ancora white noise (p-value < 0.05). Questo suggerisce che potrebbero esserci errori nel modello che richiedono un'analisi più approfondita.
+
+* ARIMA(2,0,2): Ha il valore di log likelihood più alto e i valori di AIC, AICc e BIC più bassi. Inoltre, i test sui residui sono gli unici ad aver dato un risultato positivo dal punto di vista dell'assenza di autocorrelazioni (p-value > 0.05).
+
+Nelle sezioni a seguire verrà dunque adoperato quest'ultimo modello per il fitting e le previsioni.
+<div>
+
+# Fitting del modello e previsione
+
+```{r fitting, echo=FALSE, message=FALSE, warning=FALSE}
+
+remove(h,res1,res1.2,res2,res3,sarima_model,sarima_model2)
+
+fit <- auto_model$fitted
+ts.plot(train, fit, lty=c(1:2), col=c("blue", "red"))
+legend("bottomleft", legend = c("Serie reale", "Modello"), col = c("blue", "red"), lty = c(1, 2))
+
+```
+
+<div style="text-align: justify;">
+Si osserva, lungo tutto l'arco temporale contemplato, un overlap **poco preciso** tra la curva che corrisponde ai dati nella serie reale e il modello ARIMA. Tale risultato preliminare non dovrebbe sorprendere: è di fatto coerente con la natura talvolta imprevedibile dell'andamento dei prezzi di questo genere di beni, molto influenzato da fattori esterni e casuali, che l'algoritmo non conosce e non ha modo di predire.
+
+In particolare, effettuando uno zoom sugli anni intorno al 2008...
+<div>
+
+```{r zoom, echo=FALSE, message=FALSE, warning=FALSE}
+
+# definizione intervallo
+start_year <- 2005
+end_year <- 2010
+
+# estrazione subset della serie temporale
+start_index <- which(time(train) >= start_year)[1]
+end_index <- which(time(train) <= end_year)[length(which(time(train) <= end_year))] # conversioni
+
+train_subset <- window(train, start = time(train)[start_index], end = time(train)[end_index])
+fit_subset <- window(fit, start = time(train)[start_index], end = time(train)[end_index])
+
+# Plot
+ts.plot(train_subset, fit_subset, lty = c(1, 2), col = c("blue", "red"), main = "Serie temporale tra il 2005 e il 2010")
+legend("bottomleft", legend = c("Serie reale", "Modello"), col = c("blue", "red"), lty = c(1, 2))
+
+```
+
+<div style="text-align: justify;">
+...Si evince la difficoltà del modello nel riprodurre fedelmente gli effetti della crisi finanziaria del 2008, evento straordinario e per sua natura ampiamente imprevedibile, che ha causato il crollo drastico e rapido del prezzo reale della benzina osservabile nel grafico. D'altronde, l'efficacia di un modello predittivo sta nelle condizioni quanto più **stabili e prevedibili**, ma la capacità di un modello relativamente semplice, come quello implementato in questa sezione, di anticipare eventi rari e complessi come la crisi del 2008, è limitata senza l'integrazione di informazioni e analisi macroeconomiche più profonde.
+
+Un discorso analogo può essere applicato anche al 2020, in corrispondenza della pandemia di Covid-19.
+
+Di fatto, le previsioni mostrate a seguire metteranno in evidenza proprio questa **complessità** intrinseca del fenomeno delle fluttuazioni dei prezzi del carburante, cosa che complica notevolmente l'analisi.
+<div>
+
+```{r previsioni, echo=FALSE, message=FALSE, warning=FALSE}
+
+prev <- forecast(auto_model, h=37, level=c(0.95, 0.99))
+
+plot(prev, PI = TRUE)
+lines(fit, lwd=1, col="red")
+
+```
+
+<div style="text-align: justify;">
+I modelli di previsione, come ARIMA, cercano, intuitivamente, di identificare **pattern** nei dati storici per fare previsioni sui dati futuri. Nel caso della serie storica in esame, nonostante sia stata identificata una stagionalità legata all'aumento del traffico nei mesi estivi, evidentemente essa è troppo **debole**, e l'algoritmo non ha elementi sufficienti a disposizione per fare previsioni accurate. Di conseguenza, ARIMA calcola semplicemente la media dei valori precedenti e la utilizza come previsione per il futuro: per questo motivo nel grafico appare una linea retta.
+
+I valori di accuratezza:
+<div>
+
+```{r accuratezza, echo=FALSE, message=FALSE, warning=FALSE}
+
+accuracy(prev, test)
+
+```
+
+<div style="text-align: justify;">
+Il tentativo che viene portato avanti nella sezione a seguire si propone di **ridurre la serie storica** per cercare di mitigare gli effetti peggiorativi degli eventi macroeconomici (e.g. Covid-19 e crisi del 2008) per far assumere ai dati restanti un trend meno erratico.
+
+# Riduzione della serie storica
+
+Viene scelto un intervallo che va dal 2010 al 2019.
+<div>
+
+```{r red1, echo=FALSE, message=FALSE, warning=FALSE}
+
+# definizione intervallo escludendo la crisi del 2008 e il Covid-19
+start_year <- 2010
+end_year <- 2019
+
+# estrazione subset della serie temporale
+start_index <- which(time(ts) >= start_year)[1]
+end_index <- which(time(ts) <= end_year)[length(which(time(ts) <= end_year))] # conversioni
+
+ts_subset <- window(ts, start = time(ts)[start_index], end = time(ts)[end_index])
+fit_subset <- window(fit, start = time(ts)[start_index], end = time(ts)[end_index])
+
+# train & test set
+h <- 19L
+subset_train <- diff(head(ts_subset, round(length(ts_subset) - h)))
+subset_test <- diff(tail(ts_subset, h))
+
+# ACF e PACF per la stima dei parametri da dare in input a SARIMA:
+acf(coredata(subset_train), lag.max=36) # 36 mesi == 3 anni
+pacf(coredata(subset_train), lag.max=36) # 36 mesi == 3 anni
+
+```
+
+<div style="text-align: justify;">
+Sulla base dei plot di ACF e PACF, similmente a quanto svolto in precedenza, vengono stimati i seguenti parametri:
+
+* p = 2
+* d = 0
+* q = 1
+
+* P = 1 ; P = 2
+* D = 1
+* Q = 0
+
+* S = 12
+
+Vengono implementate le seguenti combinazioni del modello sarima:
+
+* **SARIMA 3** - ARIMA (2,0,1)(1,1,0)[12]
+* **SARIMA 4** - ARIMA (2,0,1)(2,1,0)[12]
+
+<hr>
+<div>
+
+```{r sarima_reduced_3, echo=FALSE, message=FALSE, warning=FALSE}
+
+sarima_model3 <- Arima(subset_train, order = c(2, 0, 1), seasonal = list(order = c(1, 1, 0), period = 12))
+summary(sarima_model3)
+Box.test(sarima_model3$residuals, lag = 24, type = "Box-Pierce", fitdf=4)
+Box.test(sarima_model3$residuals, lag = 24, type = "Ljung-Box", fitdf=4)
+
+# fitting
+cat("Fitting del modello ARIMA(2,0,1)(1,1,0)[12]: \n")
+fit3 <- sarima_model3$fitted
+ts.plot(subset_train, fit3, lty=c(1:2), col=c("blue", "red"))
+legend("bottomleft", legend = c("Serie reale", "Modello 1"), col = c("blue", "red"), lty = c(1, 2))
+
+# previsione
+cat("Previsione del modello ARIMA(2,0,1)(1,1,0)[12]: \n")
+prev3 <- forecast(sarima_model3, h=19, level=c(0.95, 0.99))
+
+plot(prev3)
+lines(subset_test, lwd=1, col="black")
+
+cat("Accuratezza del modello ARIMA(2,0,1)(1,1,0)[12]: \n")
+accuracy(prev3, subset_test)
+
+```
+
+Si procede con P = 2.
+
+```{r sarima_reduced_4, echo=FALSE, message=FALSE, warning=FALSE}
+
+sarima_model4 <- Arima(subset_train, order = c(2, 0, 1), seasonal = list(order = c(2, 1, 0), period = 12))
+summary(sarima_model4)
+Box.test(sarima_model4$residuals, lag = 24, type = "Box-Pierce", fitdf=4)
+Box.test(sarima_model4$residuals, lag = 24, type = "Ljung-Box", fitdf=4)
+
+# fitting
+cat("Fitting del modello ARIMA(2,0,1)(2,1,0)[12]: \n")
+fit4 <- sarima_model4$fitted
+ts.plot(subset_train, fit4, lty=c(1:2), col=c("blue", "red"))
+legend("bottomleft", legend=c("Serie reale", "Modello 2"), lty=c(1:2), col=c("blue", "red"))
+
+# previsione
+cat("Previsione del modello ARIMA(2,0,1)(2,1,0)[12]: \n")
+prev4 <- forecast(sarima_model4, h=19, level=c(0.95, 0.99))
+
+plot(prev4)
+lines(subset_test, lwd=1, col="black")
+
+cat("Accuratezza del modello ARIMA(2,0,1)(2,1,0)[12]: \n")
+accuracy(prev4, subset_test)
+
+```
+
+Da un'analisi preliminare dei grafici, il modello ARIMA(2,0,1)(1,1,0)[12] sembrerebbe approssimarsi di più alla reale evoluzione dei prezzi della benzina nel test set, con la sua previsione. Tuttavia, osservando le statistiche fornite, ciò non viene confermato.
+
+Entrambi i modelli hanno valori di p-value relativamente alti per i test sui residui, indicando assenza di autocorrelazione.
+
+Il modello **ARIMA(2,0,1)(2,1,0)[12]** risulta generalmente **migliore**, più performante e preferibile rispetto ad ARIMA(2,0,1)(1,1,0)[12], smentendo un'iniziale ipotesi basata sui grafici. In particolare:
+
+* AIC e BIC: Migliori valori (più bassi) per il modello ARIMA(2,0,1)(2,1,0)[12].
+* Log Likelihood: Maggiore per il modello ARIMA(2,0,1)(2,1,0)[12], indicando un miglior adattamento.
+* Errori di Allenamento: RMSE, MAE e MASE sono tutti più favorevoli per il modello ARIMA(2,0,1)(2,1,0)[12].
+
+Prima di procedere all'implementazione delle reti neurali, si effettua un'ulteriore implementazione della funzione auto.arima().
+
+```{r iw2d, echo=FALSE, message=FALSE, warning=FALSE}
+
+auto_model_subset <- auto.arima(subset_train, ic="aic", stationary = FALSE, seasonal = TRUE) 
+summary(auto_model_subset)
+Box.test(auto_model_subset$residuals, lag = 24, type = "Box-Pierce", fitdf=4)
+Box.test(auto_model_subset$residuals, lag = 24, type = "Ljung-Box", fitdf=4)
+
+# fitting
+cat("Fitting del modello: \n")
+fit_auto <- auto_model_subset$fitted
+ts.plot(subset_train, fit_auto, lty=c(1:2), col=c("blue", "red"))
+legend("bottomleft", legend=c("Serie reale", "Modello auto"), lty=c(1:2), col=c("blue", "red"))
+
+# previsione
+cat("Previsione del modello: \n")
+prev_auto <- forecast(auto_model_subset, h=19, level=c(0.95, 0.99))
+
+plot(prev_auto)
+lines(subset_test, lwd=1, col="black")
+
+cat("Accuratezza del modello: \n")
+accuracy(prev_auto, subset_test)
+
+```
+
+A seguito di tale implementazione e di un confronto con il modello **SARIMA 4** implementato manualmente sul subset di dati che era stato decretato il migliore (ARIMA(2,0,1)(2,1,0)[12]), il modello generato automaticamente sembra avere un leggero vantaggio sia nei dati di allenamento che di test, con valori più bassi di RMSE e MAE. Inoltre, ha un valore di coefficiente di incertezza basso sui dati di test, suggerendo buone prestazioni previsionali. Il modello **ARIMA(0,0,1)(1,0,0)[12]** potrebbe essere considerato **superiore** nel complesso per la previsione sui dati di test.
+
+In particolare si vuole portare l'attenzione su come, durante questa implementazione della funzione auto.arima(), il modello generato abbia tenuto conto delle componenti stagionali (P, D, Q), risultato ben diverso dal precedente ottenuto su tutta la serie storica. Spiegazione di ciò può essere individuata nel fatto che la stagionalità del mercato del prezzo al dettaglio del carburante sia un fenomeno più marcato negli ultimi 15 anni, rispetto all'intero periodo. Pertanto, riducendo il focus sugli ultimi anni, il modello lo rileva più facilmente.
+
+```{r environment_reset, echo=FALSE, message=FALSE, warning=FALSE}
+remove(end_index,end_year,fit,fit_subset,fit3,fit4,h,start_index,start_year, train_subset,sarima_model3,sarima_model4,prev3,prev4,prev_auto,prev,fit_auto,auto_model_subset)
+```
+
+# Reti Neurali
+
+Data la complessità intrinseca del mercato dei prezzi del carburante, i modelli di previsione tradizionali spesso non riescono a catturare tutte le dinamiche imprevedibili dell'evoluzione dei dati. Con l'implementazione dei modelli ARIMA e SARIMA delle sezioni precedenti, si è giunti di fatto a questa stessa conclusione, soprattutto quando si sono osservati intervalli di tempo particolarmente estesi (laddove le fluttuazioni sono state ancora più variegate).
+
+Le reti neurali, grazie alla loro capacità di apprendere da grandi quantità di dati e di modellare relazioni non lineari, sono più adatte a cogliere i sottili pattern e le interazioni che influenzano i prezzi del petrolio (determinanti nel caso dei prezzi della benzina).
+
+Vengono di seguito adoperate nel tentativo di migliorare la predizione, in particolare si utilizzeranno reti neurali feed-forward per la previsione di serie storiche univariate.
+
+```{r nn1, echo=FALSE, message=FALSE, warning=FALSE}
+
+# si utilizzano training e test set ottenuti dal partizionamento anteriore
+
+set.seed(1234)
+fit_nnar <- nnetar(train)
+print(fit_nnar$model)
+
+options(digits=4)
+prev <- forecast(fit_nnar, h=length(diff(test)))
+plot(prev) # Plot delle previsioni
+lines(test, col = 'red')
+summary(prev)
+
+# accuratezza
+accuracy(prev, test)
+
+```
+
+Similmente al caso anteriore, si effettua uno zoom sugli anni tra il 2010 e il 2019.
+
+```{r nn1.2, echo=FALSE, message=FALSE, warning=FALSE}
+
+# si utilizzano training e test set ottenuti dal partizionamento anteriore
+
+set.seed(1234)
+fit_nnar <- nnetar(subset_train)
+print(fit_nnar$model)
+
+options(digits=4)
+prev1 <- forecast(fit_nnar, h=length(subset_test))
+plot(prev1) # Plot delle previsioni
+lines(subset_test, col = 'red')
+summary(prev1)
+
+# Accuratezza
+accuracy(prev1, subset_test)
+
+```
+
+Visti i risultati (sia sull'intera serie temporale che sul subset focalizzato sugli anni tra il 2010 e 2019), si opta per effettuare delle modifiche ai parametri dati in input all'algoritmo.
+
+```{r nn1.3, echo=TRUE, message=FALSE, warning=FALSE}
+
+set.seed(1234)
+
+fit_nnar <- nnetar(subset_train, p=2, size=10) # fitting del modello
+print(fit_nnar$model)
+
+options(digits=4)
+prev2 <- forecast(fit_nnar, PI=TRUE, npaths=5000, level=c(95, 99), exponentiale.smoothing=TRUE, seasonal.components=TRUE, h=length(subset_test)) # previsione sul test set
+plot(prev2) # plot delle previsioni
+lines(subset_test, col = 'red')
+summary(prev2)
+
+# accuratezza
+accuracy(prev2, subset_test)
+
+```
+
+<div style="text-align: justify;">
+In conclusione: 
+
+* La prima rete neurale su tutta la serie storica ha prestazioni medie sia sui dati di allenamento che sui dati di test, ma non eccelle in nessuna delle metriche principali.
+
+* La seconda rete neurale, implementata sul subset della serie storica, mostra una buona prestazione sui dati di test, con il RMSE e MAE più bassi rispetto agli altri modelli. È quindi il migliore per le previsioni sui dati non visti.
+
+* Infine, l'ultimo modello è il migliore in base alle metriche di errore sui dati di allenamento, ma mostra un peggioramento nelle prestazioni sui dati di test rispetto agli altri modelli.
+
+# Confronto tra NNAR(2,1,10)[12] e ARIMA(0,0,1)(1,0,0)[12] 
+
+In linea di massima, le reti neurali sono potenzialmente più flessibili e adattabili alle relazioni complesse nei dati, tuttavia tendono ad essere inclini all'**overfitting**. Dall'altro lato, i modelli ARIMA e SARIMA sono più **semplici** ma proprio per questo talvolta non capaci di catturare appieno le relazioni tra i dati.
+
+In base ai risultati forniti dai modelli:
+
+* Performance della rete neurale NNAR(2,1,10)[12]:
+
+  * Errori di training: Bassi (ME = -0.0002, RMSE = 0.0386)
+  * Errori di test: Più alti rispetto al training (ME = 0.0407, RMSE = 0.2008). Questo indica un possibile overfitting.
+  * ACF1 di test: Alto (0.39586) suggerendo una certa autocorrelazione negli errori, ulteriore segnale di overfitting.
+
+* Performance del modello ARIMA(0,0,1)(1,0,0)[12]:
+
+  * Errori di training: Moderatamente alti (ME = -0.0019, RMSE = 0.1254)
+  * Errori di test: Simili a quelli di training (ME = -0.0052, RMSE = 0.1272). Questo indica una buona generalizzabilità.
+  * ACF1 di test: Basso (0.2305) suggerendo poca autocorrelazione negli errori.
+
+Il modello SARIMA presenta errori di training e di test simili, indicando una buona generalizzabilità per i dati non visti. Inoltre, il basso valore di ACF1 di test suggerisce che il modello non soffre di autocorrelazione negli errori.
+
+Tuttavia, la rete neurale potrebbe essere una scelta migliore, soprattutto se si sospetta che i dati presentino relazioni non lineari complesse: dato il contesto di riferimento (fluttuazioni del prezzo della benzina) e la necessità di catturare queste criticità, è preferibile utilizzare il modello **NNAR(2,1,10)[12]**. Per un'analisi più approfondita sarà tuttavia importante esaminare con più attenzione il fenomeno dell'overfitting di cui sembra star soffrendo la previsione in esame. Questo punto verrà approfondito nelle conclusioni.
+
+# Conclusioni e possibili spunti per ulteriori analisi
+
+Sebbene la previsione dell'andamento dei prezzi del carburante rimanga una **sfida complessa**, l'utilizzo delle reti neurali in questo studio ha rappresentato un leggero miglioramento dal punto di vista degli errori sul training set.
+
+Ciononostante, si legge chiaramente dai grafici delle previsioni sul test set che la curva non si approssima all'evoluzione osservabile nei dati reali. Alcune fluttuazioni, soprattutto quelle generate da eventi randomici come le crisi economiche, rendono infatti il mercato del petrolio **altamente imprevedibile** e la predizione abbastanza inaccurata.
+
+Ad ogni modo, l'analisi di questo elaborato ha offerto interessanti riflessioni e si propone di servire come spunto per una comprensione di:
+
+* **Tendenze**: seppur deboli, sono stati identificati pattern stagionali nei prezzi della benzina.
+
+* **Comportamento storico**: la visualizzazione di questa serie permette di acquisire una visione d'insieme dello storico dei prezzi della benzina dal 1995 ad oggi, e di come siano stati influenzati dagli eventi più importanti del panorama mondiale.
+
+* Strategie di **gestione del rischio**: anche se le previsioni non sono altamente precise, possono comunque supportare strategie di gestione del rischio, come la pianificazione di scorte e l'ottimizzazione della catena di approvvigionamento, per minimizzare l'impatto delle fluttuazioni dei prezzi.
+
+La difficoltà nel prevedere con alta precisione i prezzi futuri della benzina sottolinea l'importanza, per un'eventuale espansione futura di questo elaborato, di **considerare anche fattori esterni imprevisti**, come crisi geopolitiche/macroeconomiche, cambiamenti nelle politiche energetiche e fluttuazioni della domanda e dell'offerta. Arricchire la serie storica con un insieme esaustivo di questi dati potrebbe portare allo sviluppo di modelli più resilienti e accurati.
+</div>
